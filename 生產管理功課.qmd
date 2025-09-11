@@ -1,0 +1,213 @@
+---
+title: "HW1 Times series model forecast"
+date: today
+author: 溫翎傑
+format:
+ pdf:
+    include-in-header:
+      - text: |
+         \usepackage{setspace,relsize}
+mainfont: "Microsoft JhengHei UI"
+toc: true
+---
+
+中文
+
+#Explain Data
+
+解式資料:
+
+本次分析主要為收盤價，可以看出平均收盤價為 137，美股價介於 94.3–183，顯示分布右偏（大部分集中在 120–150，少數高價拉高尾端）
+
+```{r}
+#| output: asis
+library(readr)
+library(skimr)
+nvidia <- read_csv("nvidia.csv")
+head(nvidia)
+skim(nvidia)
+
+
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Simple EDA
+
+整理所需資料並把收盤價提取出來，可以看出季節成分(seasonal)以frequency = 5 (五個交易日為一組)進行重複循環模式，每周股價有規律的上下擺動，然而隨機成分(random)的過強導致季節規律不明顯，仍可從下圖整體總結出股價有長期上升趨勢。
+
+```{r}
+#| output: asis
+
+#download packages
+library(readr)
+library(dplyr)
+library(lubridate)
+library(forecast)
+library(ggplot2)
+library(tseries)
+#
+df  <- read_csv("nvidia.csv")%>%
+  mutate(Date  = as.Date(Date),
+         Close = readr::parse_number(as.character(Close))) %>%
+  arrange(Date) %>%
+  filter(Date <= as.Date("2025-09-05")) %>%
+  filter(!is.na(Close))
+  
+stopifnot(nrow(df) > 30)  # 確保有足夠資料可訓練
+#取收盤價
+
+series_vec <- df %>% pull(Close) %>% as.numeric()
+series_ts  <- ts(series_vec)
+
+
+y <- df$Close
+y_ts <- ts(y, frequency = 5)
+
+fit <- decompose(y_ts, type = "additive")
+plot(fit)
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#ARIMA Model
+
+使用auto ARIMA 讓模型自己跑出合適的ARIMA(p ,d ,q)，模型是在「一階差分過後的序列」上，套用一個 AR(1) + MA(1) 的結構。可以說明反向震盪 (AR 部分)，但同時受到 殘差記憶效應 (MA 部分) 的影響。模型擬合不錯，可以用來做短期預測。
+
+```{r}
+#| output: asis
+fit <- forecast::auto.arima(series_ts, seasonal = FALSE, stepwise = TRUE, approximation = FALSE)
+print(fit)
+
+
+```
+
+
+
+
+
+
+
+
+
+#Forecast
+
+預測83筆資料
+
+```{r}
+#| output: asis
+h  <- 83
+fc <- forecast::forecast(fit, h = h)
+print(fc)
+
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#Plot
+
+去除掉假日，預測每筆單點工作日的估計值，並製作成圖表。
+
+```{r}
+#| output: asis
+start_date <- as.Date("2025-09-05")
+gen_trading_days <- function(start, n) {
+  out <- as.Date(character())
+  d <- start
+  while (length(out) < n) {
+    d <- d + days(1)
+    if (!lubridate::wday(d) %in% c(1, 7)) out <- c(out, d)  # 1=週日, 7=週六
+  }
+  out
+}
+future_dates <- gen_trading_days(start_date, h)
+result_table <- tibble(
+  Date = future_dates,
+  Pred = as.numeric(fc$mean),
+  Lo95 = as.numeric(fc$lower[, "95%"]),
+  Hi95 = as.numeric(fc$upper[, "95%"])
+)
+print(result_table)
+
+
+hist_df <- tibble(Date = df$Date, Value = as.numeric(series_ts))
+fc_df   <- tibble(Date = future_dates, Value = result_table$Pred,
+                  Lo95 = result_table$Lo95, Hi95 = result_table$Hi95)
+
+
+
+ggplot() +
+  geom_line(data = hist_df, aes(Date, Value), linewidth = 0.8) +
+  geom_ribbon(data = fc_df, aes(Date, ymin = Lo95, ymax = Hi95), alpha = 0.2) +
+  geom_line(data = fc_df, aes(Date, Value), linewidth = 0.9, color = "blue") +
+  labs(title = "NVIDIA 收盤價：ARIMA 預測",
+       x = "日期", y = "收盤價 (USD)") +
+  theme_minimal(base_size = 13)
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#結論
+
+可以看出預測部分的信賴區間，越後面顯示的間距越來越大，反映股票市場的不確定性，有許多外在因素干擾。再者，音資料選擇了近一年的股票收盤價，ARIMA模型對於近一年的資料所學到的趨勢、季節性可能有限，預測結果較依賴於近期的自相關，而長期預測區間很快就會變寬，這也說明為何信賴區間到後面變得越來越寬，近一年資料所反映出來的準確率會隨著預測時間的長短所產生變化，越近期越準，後期準確率較不准。
