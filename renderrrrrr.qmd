@@ -1,0 +1,649 @@
+---
+title: "smote 方法"
+author: "溫翎傑"
+date: today
+jupyter: python3
+execute:
+  echo: true
+  kernel: "jerry-313"
+
+format:
+  pdf:
+    pdf-engine: xelatex
+    toc: true
+    toc-depth: 2
+    number-sections: true
+    mainfont: "Microsoft JhengHei UI"
+    fontsize: 12pt
+    geometry: margin=1in
+    include-in-header:
+      - text: |
+          \usepackage{setspace}
+          \usepackage{relsize}
+          \usepackage{booktabs}
+          \usepackage{longtable}
+          \usepackage{adjustbox}   % 把表格縮到頁寬
+          \usepackage{tabularx}    % 欄位自動換行（可選）
+          \usepackage{pdflscape}   % 需要時用橫向頁面（可選）
+---
+
+中文
+
+# format
+
+Smote 演算法通常用於處理資料及類別不平衡的問題 醫療診斷中陽性病例只有 5%，陰性病例有95%。 這樣的數據會導致模型偏向於預測「陰性」，忽略了重要的少數類別。 所以傳統解決辦法
+
+1.欠採樣（undersampling）：隨機刪除部分多數類別樣本
+
+2.過採樣（oversampling）：可能會造成過擬合
+
+但通常有
+
+1.smote + tomek link:適合結構化 tabular data （數值型或類別編碼後的特徵）。少數類與多數類的樣本
+在邊界交疊 很多，例如：醫療診斷、欺詐檢測。
+
+特徵維度可以中等（10–100 維），但如果太高維，鄰居關係會不穩定 （curse of dimensionality）。
+
+2.smote + ENN:有明顯噪音或錯標記 (mislabeling) 的資料集。
+
+數值型或類別型皆可，但需要能計算「鄰居」距離，所以通常會做 one-hot encoding 或標準化。 資料邊界不只模糊，還有「孤立點」 例如社會科學調查：問卷中有人亂填，導致回答異常。\
+
+# algorithm
+
+1.對每一筆少數類別樣本x找出最接近的k個鄰居
+
+2.隨機選出一個鄰居x_neigh
+
+3.對x跟x_neigh之間機取一點作為新樣本：
+
+$$
+x_{new} = x + \delta\times(x[neigh] - x) , \delta \sim U(0,1)
+$$
+
+4.重複這個過程，直到少數類別樣本數量達到指定比例。
+
+# cluster
+
+| 方法 | 類型 | 主要目的 | 優點 | 缺點 | 適用情境 |
+|------|------|----------|------|------|----------|
+
+| **SMOTE + Tomek Link** \| 過採樣 + 欠採樣 \| 平衡數據 + 清理邊界 \| 邊界更清楚，避免多數類壓制 \| 刪掉邊界樣本可能過度簡化 \| 分類邊界模糊，類別交疊 \|
+
+| **SMOTE + ENN** \| 過採樣 + 欠採樣/去噪 \| 去除噪音樣本 \| 能刪掉噪音與錯誤標籤 \| 可能刪太多，少數類不足 \| 資料含有雜訊、錯標問題 \|
+
+| **Bootstrap → SMOTE → Monte Carlo** \| 重抽樣 + 模擬 \| 估計效能分布 \| 有信賴區間，評估更穩健 \| 計算量大，不直接清理數據 \| 做研究、報告，需嚴謹效能估計 \|
+
+
+
+
+```{python}
+import matplotlib as mpl
+from matplotlib import font_manager
+
+font_path = r"C:\Windows\Fonts\msjh.ttc"  # 微軟正黑體；或改成你安裝的 Noto CJK 檔案
+font_manager.fontManager.addfont(font_path)
+mpl.rcParams['font.family'] = font_manager.FontProperties(fname=font_path).get_name()
+mpl.rcParams['axes.unicode_minus'] = False
+
+```
+
+
+
+#  do smote 
+
+下載所需套件
+
+
+
+```{python}
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from sklearn.model_selection import train_test_split
+from sklearn.decomposition import PCA
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import roc_auc_score ,classification_report
+from sklearn.preprocessing import MinMaxScaler
+from imblearn.datasets import fetch_datasets
+from imblearn.over_sampling import SMOTE
+from imblearn.combine import SMOTETomek, SMOTEENN
+sns.set(style="white")
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.datasets import make_classification
+from imblearn.pipeline import Pipeline
+from imblearn.over_sampling import BorderlineSMOTE
+from sklearn.model_selection import cross_validate
+```
+
+#   smote 
+
+下面先使用pca降維，在用套件標準化，在分成訓練集跟測試集，下面用不同的方法，
+
+但依定要先切愛做smote ，第二個才有做到smote，
+
+因為先對全資料做 PCA / 縮放
+
+在整個 X 上 fit_transform 了 PCA 和 MinMaxScaler。
+
+這代表 PCA 的主成分方向、縮放的最小值/最大值是「用到測試集統計量」算出來的。
+
+模型因此「看到了」測試集的分布資訊 → 評估偏樂觀。
+
+正確做法：只在訓練集上 fit（學到統計量/主成分），再用 transform 套到測試集。
+
+交叉驗證時的典型外洩，把這些步驟包進 Pipeline，讓每一折只在該折的訓練子集上 fit
+
+下面一條「為了畫 decision boundary 的 2D 視覺化流程」，
+
+一條「為了拿到可信 AUC 的交叉驗證管線」
+
+```{python}
+df = fetch_datasets()['protein_homo']
+X = PCA(n_components=2).fit_transform(df.data)
+X = MinMaxScaler().fit_transform(X)
+Y = df.target
+
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.33, random_state=42, shuffle=True
+)
+print('X_Shape :', X.shape)
+print('Y_Shape :', Y.shape)
+print('Positive Ratio :', np.count_nonzero(Y == 1) / Y.shape[0])
+
+
+lr = LogisticRegression().fit(X_train, Y_train)
+Y_pred = lr.predict(X_test)
+
+print('Report :', classification_report(Y_test, Y_pred))
+print('ROC :', roc_auc_score(Y_test, Y_pred))
+
+plot_base = np.linspace(0, 1, 1000)
+value = (-lr.coef_[0][0] * plot_base - lr.intercept_) / lr.coef_[0][1]
+
+sns.scatterplot(x= X_train[:, 0], y = X_train[:, 1], hue=Y_train)
+plt.plot(plot_base, value)
+plt.title('Positive Sample')
+plt.ylim(0, 1)
+plt.show()
+
+```
+
+```{python}
+df = fetch_datasets()['protein_homo']
+X = PCA(n_components=2).fit_transform(df.data)
+X = MinMaxScaler().fit_transform(X)
+Y = df.target
+
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.33, random_state=42, shuffle=True
+)
+# smote 方法
+X_res , Y_res = SMOTE(random_state=42).fit_resample(X_train,Y_train)
+lr = LogisticRegression().fit(X_train, Y_train)
+Y_pred = lr.predict(X_test)
+
+print('Report :', classification_report(Y_test, Y_pred))
+print('ROC :', roc_auc_score(Y_test, Y_pred))
+
+plot_base = np.linspace(0, 1, 1000)
+value = (-lr.coef_[0][0] * plot_base - lr.intercept_) / lr.coef_[0][1]
+
+sns.scatterplot(x=X_res[:, 0],y= X_res[:, 1], hue=Y_res)
+plt.plot(plot_base, value)
+plt.title('Positive Sample')
+plt.ylim(0, 1)
+plt.show()
+
+
+```
+
+
+```{python}
+df = fetch_datasets()['protein_homo']
+X0, y = df.data, df.target
+X_tr0, X_te0, y_tr, y_te = train_test_split(
+    X0, y, test_size=0.33, random_state=42, shuffle=True
+)
+
+# 2) 只在訓練集 fit PCA/Scaler，再 transform 到 2D 且縮放到 [0,1]
+pca = PCA(n_components=2)
+scaler = MinMaxScaler()
+X_tr = scaler.fit_transform(pca.fit_transform(X_tr0))
+X_te = scaler.transform(pca.transform(X_te0))
+
+# 3) SMOTE 只對訓練集，並用過採樣後的資料來訓練
+X_res, y_res = SMOTE(random_state=42).fit_resample(X_tr, y_tr)
+
+lr = LogisticRegression(max_iter=1000).fit(X_res, y_res)  # ← 用 X_res, y_res
+
+# 4) 評估：分類報告用標籤、AUC 用機率
+y_pred  = lr.predict(X_te)
+y_proba = lr.predict_proba(X_te)[:, 1]
+print('Report:\n', classification_report(y_te, y_pred))
+print('ROC AUC:', roc_auc_score(y_te, y_proba))
+
+# 5) 視覺化（在 2D 縮放空間畫訓練資料 + 決策邊界）
+sns.set(style="whitegrid")
+plt.figure(figsize=(6, 5))
+sns.scatterplot(x=X_res[:, 0], y=X_res[:, 1], hue=y_res, s=18, alpha=0.7, edgecolor=None)
+
+w = lr.coef_[0]; b = lr.intercept_[0]
+x1 = np.linspace(0, 1, 500)
+# 避免 w[1] 非常接近 0 導致發散
+eps = 1e-12 if abs(w[1]) < 1e-12 else 0.0
+x2 = -(w[0] * x1 + b) / (w[1] + eps)
+
+plt.plot(x1, x2, linewidth=2)
+plt.title('SMOTE (train only) + Logistic Regression decision boundary')
+plt.xlim(0, 1); plt.ylim(0, 1)
+plt.legend(title='class')
+plt.tight_layout()
+plt.show()
+
+pipe = Pipeline(steps=[
+    ("pca", PCA(n_components=2)),
+    ("scale", MinMaxScaler()),
+    ("smote", SMOTE(random_state=42)),       # 只在訓練折上做
+    ("clf", LogisticRegression(max_iter=1000))
+])
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+scores = cross_val_score(pipe, X0, y, cv=cv, scoring="roc_auc")  # 會自動在每折內 fit
+print("CV AUC:", scores.mean(), "+/-", scores.std())
+
+```
+
+#  boardline smote
+
+過採樣資料作羅吉斯回歸
+
+
+```{python}
+df = fetch_datasets()['protein_homo']
+X = PCA(n_components=2).fit_transform(df.data)
+X = MinMaxScaler().fit_transform(X)
+Y = df.target
+
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.33, random_state=42, shuffle=True
+)
+
+# --- Borderline-SMOTE (borderline-2) ---
+
+bl_smote = BorderlineSMOTE(random_state=42, kind='borderline-2')
+X_res, Y_res = bl_smote.fit_resample(X_train, Y_train)
+
+# --- Train on resampled data ---
+lr = LogisticRegression(solver='liblinear', random_state=42).fit(X_res, Y_res)
+
+# --- Predict & Metrics ---
+y_prob = lr.predict_proba(X_test)[:, 1]
+y_pred = (y_prob >= 0.5).astype(int)
+
+print('Report:\n', classification_report(Y_test, y_pred))
+print('ROC AUC:', roc_auc_score(Y_test, y_prob))
+
+# --- Decision boundary (for visualization on [0,1]x[0,1]) ---
+plot_base = np.linspace(0, 1, 1000)
+# w0 * x + w1 * y + b = 0  →  y = -(w0*x + b)/w1
+w0, w1 = lr.coef_[0]
+b = lr.intercept_[0]
+value = (-(w0 * plot_base) - b) / w1
+
+# --- Plot ---
+sns.scatterplot(x=X_res[:, 0], y=X_res[:, 1], hue=Y_res, palette='deep', s=35)
+plt.plot(plot_base, value)
+plt.title('Borderline-SMOTE (borderline-2) — Resampled Train')
+plt.ylim(0, 1); plt.xlim(0, 1)
+plt.show()
+
+
+```
+
+```{python}
+RANDOM_STATE = 42
+
+# 取資料
+df = fetch_datasets()['protein_homo']
+X0, y0 = df.data, df.target
+
+# ------------------------------
+# 路線 A：單次切分 (Hold-out)
+# ------------------------------
+X_tr, X_te, y_tr, y_te = train_test_split(
+    X0, y0, test_size=0.33, stratify=y0, shuffle=True, random_state=RANDOM_STATE
+)
+
+# 建立避免外洩的管線：PCA(可關/可調) → Scaler → (邊界)SMOTE → LR
+pipe_holdout = Pipeline(steps=[
+    ("pca", PCA(n_components=2)),                 # 視覺化想畫決策邊界時用 2；若追求表現可關閉/調大
+    ("scale", MinMaxScaler()),
+    ("smote", BorderlineSMOTE(random_state=RANDOM_STATE, kind="borderline-2")),
+    ("clf", LogisticRegression(
+        solver="liblinear", max_iter=1000, random_state=RANDOM_STATE
+        # , class_weight="balanced"   # 想比較不重採樣時也可用這個
+    ))
+])
+
+# 只在訓練集 fit（PCA/Scaler/SMOTE 都只用訓練資料的統計量 & 重採樣）
+pipe_holdout.fit(X_tr, y_tr)
+
+# 用管線直接在測試集預測（內部會用訓練時學到的 pca/scale 轉換）
+proba_te = pipe_holdout.predict_proba(X_te)[:, 1]
+pred_te  = (proba_te >= 0.5).astype(int)
+
+print("=== Hold-out 評估 ===")
+print(classification_report(y_te, pred_te))
+print("ROC AUC:", roc_auc_score(y_te, proba_te))
+
+
+# --------------------------------
+# 路線 B：交叉驗證 (每折避免外洩)
+# --------------------------------
+# 建一條用於 CV 的管線（通常建議先「不壓 2D」以追求較佳表現）
+pipe_cv = Pipeline(steps=[
+    # ("pca", PCA(n_components=10)),              # 想比較再打開；或乾脆拿掉 PCA
+    ("scale", MinMaxScaler()),
+    ("smote", SMOTE(random_state=RANDOM_STATE)),
+    ("clf", LogisticRegression(
+        solver="liblinear", max_iter=1000, random_state=RANDOM_STATE
+    ))
+])
+
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+scores = cross_validate(
+    pipe_cv, X0, y0, cv=cv,
+    scoring={"roc": "roc_auc", "pr": "average_precision"}, n_jobs=-1, return_train_score=False
+)
+print("\n=== 5-Fold CV 評估（無 PCA 版本） ===")
+print("ROC AUC (mean ± sd):", scores["test_roc"].mean(), "±", scores["test_roc"].std())
+print("PR  AUC (mean ± sd):", scores["test_pr"].mean(),  "±", scores["test_pr"].std())
+
+
+# ------------------------------------------------
+# （可選）2D 決策邊界視覺化（安全且可讀）
+# ------------------------------------------------
+# 若要畫決策邊界，務必確保：在「訓練集」fit 的 PCA/Scaler 空間內可視化
+# 這裡直接沿用 holdout 管線（其 pca=2 維），並用訓練資料來畫
+print("\n=== 2D 決策邊界（訓練空間） ===")
+# 取出已訓練好的步驟
+pca_fitted    = pipe_holdout.named_steps["pca"]
+scaler_fitted = pipe_holdout.named_steps["scale"]
+clf_fitted    = pipe_holdout.named_steps["clf"]
+
+# 把「訓練原始 X」丟進已 fit 的 pca+scale，得到訓練的 2D 座標
+X_tr_2d = scaler_fitted.transform(pca_fitted.transform(X_tr))
+
+# 用 SMOTE 畫散點通常要顯示過採樣後的點，但 Pipeline 沒有直接保留 resampled 資料
+# 若想看過採樣後的分佈，可獨立做一次（在同一個 pca/scale 空間）：
+X_res_2d, y_res = BorderlineSMOTE(random_state=RANDOM_STATE, kind="borderline-2").fit_resample(X_tr_2d, y_tr)
+
+sns.set(style="whitegrid")
+plt.figure(figsize=(6,5))
+sns.scatterplot(x=X_res_2d[:,0], y=X_res_2d[:,1], hue=y_res, s=18, alpha=0.7, edgecolor=None)
+
+# 從已訓練好的分類器取係數，畫邏輯斯迴歸的決策線： w1*x + w2*y + b = 0 → y = -(w1*x + b)/w2
+w = clf_fitted.coef_[0]; b = clf_fitted.intercept_[0]
+x1 = np.linspace(X_res_2d[:,0].min()-0.05, X_res_2d[:,0].max()+0.05, 500)
+eps = 1e-12 if abs(w[1]) < 1e-12 else 0.0
+x2 = -(w[0]*x1 + b)/(w[1] + eps)
+plt.plot(x1, x2, linewidth=2)
+
+plt.xlim(X_res_2d[:,0].min()-0.05, X_res_2d[:,0].max()+0.05)
+plt.ylim(X_res_2d[:,1].min()-0.05, X_res_2d[:,1].max()+0.05)
+plt.title("Borderline-SMOTE (train only) + LR decision boundary (2D PCA space)")
+plt.tight_layout()
+plt.show()
+
+
+```
+
+#  smote + tomeklinks
+
+分別都在pca那裏的部分作先fit跟後fit
+```{python}
+from imblearn.under_sampling import TomekLinks
+# --- Data ---
+df = fetch_datasets()['protein_homo']
+X = PCA(n_components=2).fit_transform(df.data)
+X = MinMaxScaler().fit_transform(X)
+Y = df.target
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.33, random_state=42, shuffle=True
+)
+
+# --- SMOTE + TomekLinks ---
+# Pipeline: SMOTE+Tomek → LR
+X_sm, y_sm = SMOTE(random_state=42).fit_resample(X_train, Y_train)
+X_res, y_res = TomekLinks().fit_resample(X_sm, y_sm)
+
+# --- Train ---
+lr = LogisticRegression(solver='liblinear', random_state=42).fit(X_res, y_res)
+
+# --- Metrics ---
+y_prob = lr.predict_proba(X_test)[:, 1]
+y_pred = (y_prob >= 0.5).astype(int)
+print('Report:\n', classification_report(Y_test, y_pred))
+print('ROC AUC:', roc_auc_score(Y_test, y_prob))
+
+# --- Decision boundary ---
+w0, w1 = lr.coef_[0]; b = lr.intercept_[0]
+xx = np.linspace(0, 1, 1000)
+yy = (-(w0 * xx) - b) / w1
+
+# --- Plot ---
+sns.scatterplot(x=X_res[:, 0], y=X_res[:, 1], hue=y_res, s=35)
+plt.plot(xx, yy)
+plt.title('SMOTE + TomekLinks (resampled train)')
+plt.xlim(0, 1); plt.ylim(0, 1)
+plt.show()
+
+
+```
+
+
+```{python}
+from imblearn.under_sampling import TomekLinks
+# --- Data ---
+df = fetch_datasets()['protein_homo']
+X0, y = df.data, df.target
+
+# 先切，再在訓練集 fit（避免外洩）
+X_tr0, X_te0, y_tr, y_te = train_test_split(
+    X0, y, test_size=0.33, random_state=42, shuffle=True, stratify=y
+)
+
+pca, scaler = PCA(n_components=2), MinMaxScaler()
+X_tr = scaler.fit_transform(pca.fit_transform(X_tr0))   # train: fit
+X_te = scaler.transform(pca.transform(X_te0))           # test: transform
+
+# SMOTE → TomekLinks 只作用於訓練資料
+X_sm, y_sm = SMOTE(random_state=42).fit_resample(X_tr, y_tr)
+X_res, y_res = TomekLinks().fit_resample(X_sm, y_sm)
+
+# 訓練與評估
+lr = LogisticRegression(solver='liblinear', max_iter=1000, random_state=42).fit(X_res, y_res)
+y_prob = lr.predict_proba(X_te)[:, 1]
+y_pred = (y_prob >= 0.5).astype(int)
+print('Report:\n', classification_report(y_te, y_pred))
+print('ROC AUC:', roc_auc_score(y_te, y_prob))
+
+# 畫決策線（用訓練座標範圍更穩）
+w0, w1 = lr.coef_[0]; b = lr.intercept_[0]
+x1 = np.linspace(X_res[:,0].min()-0.05, X_res[:,0].max()+0.05, 600)
+eps = 1e-12 if abs(w1) < 1e-12 else 0.0
+y1 = (-(w0 * x1) - b) / (w1 + eps)
+
+sns.scatterplot(x=X_res[:,0], y=X_res[:,1], hue=y_res, s=30, alpha=0.8, edgecolor=None)
+plt.plot(x1, y1, linewidth=2)
+plt.xlim(X_res[:,0].min()-0.05, X_res[:,0].max()+0.05)
+plt.ylim(X_res[:,1].min()-0.05, X_res[:,1].max()+0.05)
+plt.title('SMOTE + TomekLinks (train only)')
+plt.tight_layout(); plt.show()
+
+
+```
+
+
+
+
+#  smote + ENN
+
+一樣的事情
+```{python}
+from imblearn.under_sampling import EditedNearestNeighbours
+# --- Data ---
+df = fetch_datasets()['protein_homo']
+X = PCA(n_components=2).fit_transform(df.data)
+X = MinMaxScaler().fit_transform(X)
+Y = df.target
+X_train, X_test, Y_train, Y_test = train_test_split(
+    X, Y, test_size=0.33, random_state=42, shuffle=True
+)
+
+# --- SMOTE + ENN ---
+X_sm, y_sm = SMOTE(random_state=42).fit_resample(X_train, Y_train)
+# n_neighbors 預設 3，可依資料噪音程度調整
+X_res, y_res = EditedNearestNeighbours(n_neighbors=3).fit_resample(X_sm, y_sm)
+
+# --- Train ---
+lr = LogisticRegression(solver='liblinear', random_state=42).fit(X_res, y_res)
+
+# --- Metrics ---
+y_prob = lr.predict_proba(X_test)[:, 1]
+y_pred = (y_prob >= 0.5).astype(int)
+print('Report:\n', classification_report(Y_test, y_pred))
+print('ROC AUC:', roc_auc_score(Y_test, y_prob))
+
+# --- Decision boundary ---
+w0, w1 = lr.coef_[0]; b = lr.intercept_[0]
+xx = np.linspace(0, 1, 1000)
+yy = (-(w0 * xx) - b) / w1
+
+# --- Plot ---
+sns.scatterplot(x=X_res[:, 0], y=X_res[:, 1], hue=y_res, s=35)
+plt.plot(xx, yy)
+plt.title('SMOTE + ENN (resampled train)')
+plt.xlim(0, 1); plt.ylim(0, 1)
+plt.show()
+
+
+```
+
+
+
+```{python}
+from imblearn.under_sampling import EditedNearestNeighbours
+# --- Data ---
+df = fetch_datasets()['protein_homo']
+X0, y = df.data, df.target
+
+# 1) 先切再 fit（避免外洩）
+X_tr0, X_te0, y_tr, y_te = train_test_split(
+    X0, y, test_size=0.33, random_state=42, shuffle=True, stratify=y
+)
+
+pca, scaler = PCA(n_components=2), MinMaxScaler()
+X_tr = scaler.fit_transform(pca.fit_transform(X_tr0))   # 只在 train fit
+X_te = scaler.transform(pca.transform(X_te0))           # test 僅 transform
+
+# 2) SMOTE → ENN 僅對訓練資料
+X_sm, y_sm = SMOTE(random_state=42).fit_resample(X_tr, y_tr)
+# 想只清多數類可：EditedNearestNeighbours(n_neighbors=3, sampling_strategy='majority')
+X_res, y_res = EditedNearestNeighbours(n_neighbors=3).fit_resample(X_sm, y_sm)
+
+# 3) 訓練與評估
+lr = LogisticRegression(solver='liblinear', max_iter=1000, random_state=42).fit(X_res, y_res)
+y_prob = lr.predict_proba(X_te)[:, 1]
+y_pred = (y_prob >= 0.5).astype(int)
+print('Report:\n', classification_report(y_te, y_pred))
+print('ROC AUC:', roc_auc_score(y_te, y_prob))
+
+# 4) 決策邊界（用訓練範圍作圖更穩）
+w0, w1 = lr.coef_[0]; b = lr.intercept_[0]
+x1 = np.linspace(X_res[:,0].min()-0.05, X_res[:,0].max()+0.05, 600)
+eps = 1e-12 if abs(w1) < 1e-12 else 0.0
+y1 = (-(w0*x1) - b) / (w1 + eps)
+
+sns.scatterplot(x=X_res[:,0], y=X_res[:,1], hue=y_res, s=35, alpha=0.8, edgecolor=None)
+plt.plot(x1, y1, linewidth=2)
+plt.xlim(X_res[:,0].min()-0.05, X_res[:,0].max()+0.05)
+plt.ylim(X_res[:,1].min()-0.05, X_res[:,1].max()+0.05)
+plt.title('SMOTE + ENN (train only)'); plt.tight_layout(); plt.show()
+
+```
+
+#  crossfit
+
+這邊先做資料與評估設定，三條 Pipeline，交叉驗證與彙整
+
+```{python}
+from sklearn.model_selection import cross_val_score, StratifiedKFold
+from sklearn.linear_model import LogisticRegression
+from sklearn.datasets import make_classification
+from imblearn.pipeline import Pipeline
+from imblearn.over_sampling import BorderlineSMOTE
+from sklearn.model_selection import StratifiedKFold, cross_validate
+from IPython.display import display, Markdown
+
+
+df = fetch_datasets()['protein_homo']
+X, y = df.data, df.target
+
+# ===== 共用設定 =====
+cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=42)
+scoring = {
+    'roc_auc': 'roc_auc',
+    'f1_macro': 'f1_macro',
+    'pr_auc': 'average_precision',  # Precision-Recall AUC
+}
+clf = LogisticRegression(solver='liblinear', random_state=42)
+
+# ===== 三種 Pipeline =====
+pipelines = {
+    # Baseline：不做重取樣（但保留同樣的前處理，公平比較）
+    'baseline': Pipeline([
+        ('scale', MinMaxScaler()),
+        ('pca', PCA(n_components=2, random_state=42)),   # 你前面有用到 2D，可改成不降維
+        ('clf', clf),
+    ]),
+    # SMOTE + TomekLinks
+    'smote_tomek': Pipeline([
+        ('scale', MinMaxScaler()),
+        ('pca', PCA(n_components=2, random_state=42)),
+        ('resample', SMOTETomek(random_state=42)),
+        ('clf', clf),
+    ]),
+    # SMOTE + ENN
+    'smote_enn': Pipeline([
+        ('scale', MinMaxScaler()),
+        ('pca', PCA(n_components=2, random_state=42)),
+        ('resample', SMOTEENN(random_state=42)),
+        ('clf', clf),
+    ]),
+}
+
+# ===== 交叉驗證並彙整結果 =====
+rows = []
+for name, pipe in pipelines.items():
+    cv_res = cross_validate(pipe, X, y, cv=cv, scoring=scoring, n_jobs=-1, return_train_score=False)
+    rows.append({
+        'method': name,
+        'roc_auc_mean': np.mean(cv_res['test_roc_auc']),
+        'roc_auc_std':  np.std(cv_res['test_roc_auc']),
+        'f1_macro_mean': np.mean(cv_res['test_f1_macro']),
+        'f1_macro_std':  np.std(cv_res['test_f1_macro']),
+        'pr_auc_mean': np.mean(cv_res['test_pr_auc']),
+        'pr_auc_std':  np.std(cv_res['test_pr_auc']),
+    })
+
+
+
+result = pd.DataFrame(rows).sort_values('roc_auc_mean', ascending=False)
+print(result.to_string(index=False, float_format=lambda x: f"{x:.4f}"))
+
+
+```
